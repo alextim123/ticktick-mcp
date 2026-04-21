@@ -64,7 +64,7 @@ class StaticBearerTokenVerifier:
         return AccessToken(
             token=token,
             client_id="ticktick-mcp",
-            scopes=["ticktick"],
+            scopes=["ticktick", READ_SCOPE, WRITE_SCOPE],
         )
 
 
@@ -158,7 +158,7 @@ def _build_mcp_auth(port: int):
         auth = AuthSettings(
             issuer_url=public_url,
             resource_server_url=public_url,
-            required_scopes=[READ_SCOPE],
+            required_scopes=ALL_SCOPES,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True,
                 valid_scopes=ALL_SCOPES,
