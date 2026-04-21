@@ -17,6 +17,7 @@ env/
 # Environment variables (contains sensitive API keys)
 .env
 .mcp.json
+.render-deploy.json
 .pip-cache/
 
 # IDE specific files
