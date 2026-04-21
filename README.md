@@ -123,15 +123,28 @@ MCP_PORT=8000
 MCP_PUBLIC_URL=https://your-public-domain.example
 ```
 
-Optional hardening:
+Recommended ChatGPT OAuth protection:
 
 ```env
-MCP_AUTH_TOKEN=generate-a-long-random-token
+MCP_AUTH_MODE=oauth
+MCP_OAUTH_PASSWORD=your-private-login-password
+MCP_OAUTH_TOKEN_SECRET=generate-a-long-random-token
+MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=3600
+MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS=7776000
 MCP_ALLOWED_HOSTS=your-public-domain.example
 MCP_ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
 ```
 
-Do not deploy this publicly without an access-control plan. The MCP tools can read and mutate TickTick tasks.
+`MCP_AUTH_MODE=oauth` enables a single-user OAuth 2.1 flow for ChatGPT. ChatGPT registers as an OAuth client, opens `/oauth/login`, and receives signed MCP access and refresh tokens after you enter `MCP_OAUTH_PASSWORD`. TickTick tokens remain server-side in environment variables.
+
+Bearer-token clients are still supported with:
+
+```env
+MCP_AUTH_MODE=bearer
+MCP_AUTH_TOKEN=generate-a-long-random-token
+```
+
+Do not deploy this publicly with `MCP_AUTH_MODE=none`. The MCP tools can read and mutate TickTick tasks.
 
 ### Connecting from ChatGPT
 
@@ -143,7 +156,14 @@ https://your-public-domain.example/sse
 
 Use that URL when adding a custom MCP app/server in ChatGPT.
 
-Security note: this project currently supports an optional static bearer token through `MCP_AUTH_TOKEN`, which is useful for MCP clients that can send an `Authorization: Bearer ...` header. If ChatGPT requires a full OAuth flow for your custom MCP connection, add a dedicated MCP OAuth layer before exposing write tools publicly.
+For ChatGPT, choose OAuth authentication. Dynamic Client Registration should discover:
+
+- Authorization URL: `https://your-public-domain.example/authorize`
+- Token URL: `https://your-public-domain.example/token`
+- Registration URL: `https://your-public-domain.example/register`
+- Scopes: `ticktick:read ticktick:write`
+
+Write tools require the `ticktick:write` scope. Read access to the MCP transport requires `ticktick:read`.
 
 ## Authentication with Dida365
 

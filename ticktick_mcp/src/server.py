@@ -9,10 +9,15 @@ from typing import Dict, List, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.settings import ClientRegistrationOptions
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.transport_security import TransportSecuritySettings
 from dotenv import load_dotenv
+from starlette.requests import Request
+from starlette.responses import Response
 
 from .ticktick_client import TickTickClient
+from .oauth import ALL_SCOPES, READ_SCOPE, WRITE_SCOPE, SingleUserOAuthProvider
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +26,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 SUPPORTED_TRANSPORTS = {"stdio", "sse", "streamable-http"}
+SUPPORTED_AUTH_MODES = {"auto", "none", "bearer", "oauth"}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -116,7 +122,54 @@ def _default_port() -> int:
 
 _host = _default_host()
 _port = _default_port()
-_auth, _token_verifier = _build_auth(_port)
+
+
+def _auth_mode() -> str:
+    mode = os.getenv("MCP_AUTH_MODE", "auto").strip().lower()
+    if mode not in SUPPORTED_AUTH_MODES:
+        raise ValueError(f"Unsupported MCP_AUTH_MODE={mode!r}. Use one of: {sorted(SUPPORTED_AUTH_MODES)}")
+    if mode == "auto":
+        if os.getenv("MCP_OAUTH_PASSWORD") or os.getenv("MCP_OAUTH_TOKEN_SECRET"):
+            return "oauth"
+        if os.getenv("MCP_AUTH_TOKEN"):
+            return "bearer"
+        return "none"
+    return mode
+
+
+def _build_mcp_auth(port: int):
+    mode = _auth_mode()
+    if mode == "none":
+        return None, None, None
+    if mode == "bearer":
+        if not os.getenv("MCP_AUTH_TOKEN"):
+            raise ValueError("MCP_AUTH_TOKEN must be set when MCP_AUTH_MODE=bearer")
+        auth, verifier = _build_auth(port)
+        return auth, verifier, None
+    if mode == "oauth":
+        public_url = _public_url(port)
+        provider = SingleUserOAuthProvider(
+            issuer_url=public_url,
+            password=os.getenv("MCP_OAUTH_PASSWORD", ""),
+            token_secret=os.getenv("MCP_OAUTH_TOKEN_SECRET", ""),
+            access_token_ttl_seconds=_env_int("MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS", 3600),
+            refresh_token_ttl_seconds=_env_int("MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS", 7_776_000),
+        )
+        auth = AuthSettings(
+            issuer_url=public_url,
+            resource_server_url=public_url,
+            required_scopes=[READ_SCOPE],
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=ALL_SCOPES,
+                default_scopes=ALL_SCOPES,
+            ),
+        )
+        return auth, None, provider
+    raise ValueError(f"Unsupported MCP auth mode: {mode}")
+
+
+_auth, _token_verifier, _auth_server_provider = _build_mcp_auth(_port)
 
 # Create FastMCP server
 mcp = FastMCP(
@@ -128,8 +181,15 @@ mcp = FastMCP(
     streamable_http_path=os.getenv("MCP_STREAMABLE_HTTP_PATH", "/mcp"),
     auth=_auth,
     token_verifier=_token_verifier,
+    auth_server_provider=_auth_server_provider,
     transport_security=_build_transport_security(_host),
 )
+
+
+if _auth_server_provider:
+    @mcp.custom_route("/oauth/login", methods=["GET", "POST"], include_in_schema=False)
+    async def oauth_login(request: Request) -> Response:
+        return await _auth_server_provider.handle_login(request)
 
 # Create TickTick client
 ticktick = None
@@ -225,6 +285,21 @@ def format_project(project: Dict) -> str:
     return formatted
 
 # MCP Tools
+
+def _has_scope(scope: str) -> bool:
+    if _auth is None:
+        return True
+    access_token = get_access_token()
+    if not access_token:
+        return False
+    scopes = set(access_token.scopes)
+    return scope in scopes or "ticktick" in scopes
+
+
+def _require_write_access() -> str | None:
+    if _has_scope(WRITE_SCOPE):
+        return None
+    return f"Unauthorized: this tool requires the {WRITE_SCOPE} OAuth scope."
 
 @mcp.tool()
 async def get_projects() -> str:
@@ -345,6 +420,10 @@ async def create_task(
         due_date: Due date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
     """
+    access_error = _require_write_access()
+    if access_error:
+        return access_error
+
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -402,6 +481,10 @@ async def update_task(
         due_date: New due date in ISO format YYYY-MM-DDThh:mm:ss+0000 (optional)
         priority: New priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
     """
+    access_error = _require_write_access()
+    if access_error:
+        return access_error
+
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -447,6 +530,10 @@ async def complete_task(project_id: str, task_id: str) -> str:
         project_id: ID of the project
         task_id: ID of the task
     """
+    access_error = _require_write_access()
+    if access_error:
+        return access_error
+
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -470,6 +557,10 @@ async def delete_task(project_id: str, task_id: str) -> str:
         project_id: ID of the project
         task_id: ID of the task
     """
+    access_error = _require_write_access()
+    if access_error:
+        return access_error
+
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -498,6 +589,10 @@ async def create_project(
         color: Color code (hex format) (optional)
         view_mode: View mode - one of list, kanban, or timeline (optional)
     """
+    access_error = _require_write_access()
+    if access_error:
+        return access_error
+
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -529,6 +624,10 @@ async def delete_project(project_id: str) -> str:
     Args:
         project_id: ID of the project
     """
+    access_error = _require_write_access()
+    if access_error:
+        return access_error
+
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -918,6 +1017,10 @@ async def batch_create_tasks(tasks: List[Dict[str, Any]]) -> str:
             {"title": "Example B", "project_id": "1234XYZ", "content": "Description", "start_date": "2025-07-18T10:00:00", "due_date": "2025-07-19T10:00:00"}
         ]
     """
+    access_error = _require_write_access()
+    if access_error:
+        return access_error
+
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -1070,6 +1173,10 @@ async def create_subtask(
         content: Optional content/description for the subtask
         priority: Priority level (0: None, 1: Low, 3: Medium, 5: High) (optional)
     """
+    access_error = _require_write_access()
+    if access_error:
+        return access_error
+
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."

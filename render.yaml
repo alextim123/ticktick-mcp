@@ -13,6 +13,8 @@ services:
         value: /sse
       - key: MCP_MESSAGE_PATH
         value: /messages/
+      - key: MCP_AUTH_MODE
+        value: oauth
       - key: TICKTICK_CLIENT_ID
         sync: false
       - key: TICKTICK_CLIENT_SECRET
@@ -25,6 +27,14 @@ services:
         sync: false
       - key: MCP_AUTH_TOKEN
         sync: false
+      - key: MCP_OAUTH_PASSWORD
+        sync: false
+      - key: MCP_OAUTH_TOKEN_SECRET
+        sync: false
+      - key: MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS
+        value: "3600"
+      - key: MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS
+        value: "7776000"
       - key: MCP_ALLOWED_HOSTS
         sync: false
       - key: MCP_ALLOWED_ORIGINS
