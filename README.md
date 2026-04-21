@@ -83,6 +83,68 @@ This server uses OAuth2 to authenticate with TickTick. The setup process is stra
 
 The server handles token refresh automatically, so you won't need to reauthenticate unless you revoke access or delete your `.env` file.
 
+## Remote MCP Deployment
+
+This fork can run either as a local stdio MCP server or as a remote HTTP MCP server.
+
+Local stdio mode:
+```bash
+python -m ticktick_mcp.cli run --transport stdio
+```
+
+Remote SSE mode:
+```bash
+python -m ticktick_mcp.cli run --transport sse --host 0.0.0.0
+```
+
+Remote endpoints:
+
+- SSE endpoint: `/sse`
+- SSE message endpoint: `/messages/`
+- Streamable HTTP endpoint, if enabled: `/mcp`
+
+For Docker-based hosts such as Render, Fly, Railway, or a VPS:
+
+```bash
+docker build -t ticktick-mcp .
+docker run --env-file .env -p 8000:8000 ticktick-mcp
+```
+
+Required remote environment variables:
+
+```env
+TICKTICK_CLIENT_ID=...
+TICKTICK_CLIENT_SECRET=...
+TICKTICK_ACCESS_TOKEN=...
+TICKTICK_REFRESH_TOKEN=...
+MCP_TRANSPORT=sse
+MCP_HOST=0.0.0.0
+MCP_PORT=8000
+MCP_PUBLIC_URL=https://your-public-domain.example
+```
+
+Optional hardening:
+
+```env
+MCP_AUTH_TOKEN=generate-a-long-random-token
+MCP_ALLOWED_HOSTS=your-public-domain.example
+MCP_ALLOWED_ORIGINS=https://chatgpt.com,https://chat.openai.com
+```
+
+Do not deploy this publicly without an access-control plan. The MCP tools can read and mutate TickTick tasks.
+
+### Connecting from ChatGPT
+
+After deployment, the remote MCP server URL is:
+
+```text
+https://your-public-domain.example/sse
+```
+
+Use that URL when adding a custom MCP app/server in ChatGPT.
+
+Security note: this project currently supports an optional static bearer token through `MCP_AUTH_TOKEN`, which is useful for MCP clients that can send an `Authorization: Bearer ...` header. If ChatGPT requires a full OAuth flow for your custom MCP connection, add a dedicated MCP OAuth layer before exposing write tools publicly.
+
 ## Authentication with Dida365
 
 [滴答清单 - Dida365](https://dida365.com/home) is China version of TickTick, and the authentication process is similar to TickTick. Follow these steps to set up Dida365 authentication:

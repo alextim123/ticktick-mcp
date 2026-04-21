@@ -1,0 +1,9 @@
+.git
+.venv
+.pip-cache
+__pycache__
+*.pyc
+.DS_Store
+.env
+.mcp.json
+skills

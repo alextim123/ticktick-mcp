@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import os
 import logging
@@ -6,6 +7,9 @@ from datetime import datetime, timezone, date, timedelta
 from typing import Dict, List, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.transport_security import TransportSecuritySettings
 from dotenv import load_dotenv
 
 from .ticktick_client import TickTickClient
@@ -14,8 +18,118 @@ from .ticktick_client import TickTickClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+load_dotenv()
+
+SUPPORTED_TRANSPORTS = {"stdio", "sse", "streamable-http"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s", name, value, default)
+        return default
+
+
+def _env_list(name: str) -> list[str]:
+    value = os.getenv(name, "")
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+class StaticBearerTokenVerifier:
+    """Optional bearer-token gate for remote MCP deployments."""
+
+    def __init__(self, token: str):
+        self._token = token
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not hmac.compare_digest(token, self._token):
+            return None
+        return AccessToken(
+            token=token,
+            client_id="ticktick-mcp",
+            scopes=["ticktick"],
+        )
+
+
+def _public_url(port: int) -> str:
+    return os.getenv("MCP_PUBLIC_URL") or f"http://localhost:{port}"
+
+
+def _build_auth(port: int) -> tuple[AuthSettings | None, StaticBearerTokenVerifier | None]:
+    token = os.getenv("MCP_AUTH_TOKEN")
+    if not token:
+        return None, None
+
+    public_url = _public_url(port)
+    auth = AuthSettings(
+        issuer_url=public_url,
+        resource_server_url=public_url,
+        required_scopes=["ticktick"],
+    )
+    return auth, StaticBearerTokenVerifier(token)
+
+
+def _build_transport_security(host: str) -> TransportSecuritySettings | None:
+    if _env_bool("MCP_DISABLE_DNS_REBINDING_PROTECTION", default=False):
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    allowed_hosts = _env_list("MCP_ALLOWED_HOSTS")
+    allowed_origins = _env_list("MCP_ALLOWED_ORIGINS")
+    if allowed_hosts or allowed_origins:
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
+
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return None
+
+    logger.warning(
+        "Remote host configured without MCP_ALLOWED_HOSTS; disabling DNS rebinding protection. "
+        "Set MCP_ALLOWED_HOSTS and MCP_ALLOWED_ORIGINS in production."
+    )
+    return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+
+def _default_host() -> str:
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "stdio":
+        return os.getenv("MCP_HOST", "127.0.0.1")
+    return os.getenv("MCP_HOST", "0.0.0.0")
+
+
+def _default_port() -> int:
+    return _env_int("MCP_PORT", _env_int("PORT", 8000))
+
+
+_host = _default_host()
+_port = _default_port()
+_auth, _token_verifier = _build_auth(_port)
+
 # Create FastMCP server
-mcp = FastMCP("ticktick")
+mcp = FastMCP(
+    "ticktick",
+    host=_host,
+    port=_port,
+    sse_path=os.getenv("MCP_SSE_PATH", "/sse"),
+    message_path=os.getenv("MCP_MESSAGE_PATH", "/messages/"),
+    streamable_http_path=os.getenv("MCP_STREAMABLE_HTTP_PATH", "/mcp"),
+    auth=_auth,
+    token_verifier=_token_verifier,
+    transport_security=_build_transport_security(_host),
+)
 
 # Create TickTick client
 ticktick = None
@@ -981,15 +1095,49 @@ async def create_subtask(
         logger.error(f"Error in create_subtask: {e}")
         return f"Error creating subtask: {str(e)}"
 
-def main():
+def main(
+    transport: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    sse_path: str | None = None,
+    message_path: str | None = None,
+    streamable_http_path: str | None = None,
+    mount_path: str | None = None,
+):
     """Main entry point for the MCP server."""
+    transport = transport or os.getenv("MCP_TRANSPORT", "stdio")
+    if transport not in SUPPORTED_TRANSPORTS:
+        raise ValueError(f"Unsupported transport: {transport}")
+
+    if host:
+        mcp.settings.host = host
+        mcp.settings.transport_security = _build_transport_security(host)
+    elif transport != "stdio" and mcp.settings.host in {"127.0.0.1", "localhost", "::1"}:
+        mcp.settings.host = "0.0.0.0"
+        mcp.settings.transport_security = _build_transport_security("0.0.0.0")
+
+    if port:
+        mcp.settings.port = port
+    if sse_path:
+        mcp.settings.sse_path = sse_path
+    if message_path:
+        mcp.settings.message_path = message_path
+    if streamable_http_path:
+        mcp.settings.streamable_http_path = streamable_http_path
+
     # Initialize the TickTick client
     if not initialize_client():
         logger.error("Failed to initialize TickTick client. Please check your API credentials.")
         return
     
     # Run the server
-    mcp.run(transport='stdio')
+    logger.info(
+        "Starting TickTick MCP server transport=%s host=%s port=%s",
+        transport,
+        mcp.settings.host,
+        mcp.settings.port,
+    )
+    mcp.run(transport=transport, mount_path=mount_path)
 
 if __name__ == "__main__":
     main()

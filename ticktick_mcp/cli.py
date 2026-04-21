@@ -33,9 +33,40 @@ def main():
     )
     run_parser.add_argument(
         "--transport", 
-        default="stdio", 
-        choices=["stdio"], 
-        help="Transport type (currently only stdio is supported)"
+        default=None,
+        choices=["stdio", "sse", "streamable-http"],
+        help="Transport type. Defaults to MCP_TRANSPORT or stdio."
+    )
+    run_parser.add_argument(
+        "--host",
+        default=None,
+        help="Host for HTTP transports. Defaults to MCP_HOST, or 0.0.0.0 for remote transports."
+    )
+    run_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port for HTTP transports. Defaults to MCP_PORT, PORT, or 8000."
+    )
+    run_parser.add_argument(
+        "--sse-path",
+        default=None,
+        help="SSE endpoint path. Defaults to MCP_SSE_PATH or /sse."
+    )
+    run_parser.add_argument(
+        "--message-path",
+        default=None,
+        help="SSE message endpoint path. Defaults to MCP_MESSAGE_PATH or /messages/."
+    )
+    run_parser.add_argument(
+        "--streamable-http-path",
+        default=None,
+        help="Streamable HTTP endpoint path. Defaults to MCP_STREAMABLE_HTTP_PATH or /mcp."
+    )
+    run_parser.add_argument(
+        "--mount-path",
+        default=None,
+        help="Optional mount path for SSE transport."
     )
     
     # 'auth' command for authentication
@@ -86,7 +117,15 @@ Run 'uv run -m ticktick_mcp.cli auth' to set up authentication later.
         
         # Start the server
         try:
-            server_main()
+            server_main(
+                transport=args.transport,
+                host=args.host,
+                port=args.port,
+                sse_path=args.sse_path,
+                message_path=args.message_path,
+                streamable_http_path=args.streamable_http_path,
+                mount_path=args.mount_path,
+            )
         except KeyboardInterrupt:
             print("Server stopped by user", file=sys.stderr)
             sys.exit(0)
