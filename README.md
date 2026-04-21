@@ -92,7 +92,12 @@ Local stdio mode:
 python -m ticktick_mcp.cli run --transport stdio
 ```
 
-Remote SSE mode:
+Remote Streamable HTTP mode for ChatGPT:
+```bash
+python -m ticktick_mcp.cli run --transport streamable-http --host 0.0.0.0
+```
+
+Remote SSE mode for MCP clients that explicitly support SSE:
 ```bash
 python -m ticktick_mcp.cli run --transport sse --host 0.0.0.0
 ```
@@ -101,7 +106,7 @@ Remote endpoints:
 
 - SSE endpoint: `/sse`
 - SSE message endpoint: `/messages/`
-- Streamable HTTP endpoint, if enabled: `/mcp`
+- Streamable HTTP endpoint: `/mcp`
 
 For Docker-based hosts such as Render, Fly, Railway, or a VPS:
 
@@ -117,9 +122,10 @@ TICKTICK_CLIENT_ID=...
 TICKTICK_CLIENT_SECRET=...
 TICKTICK_ACCESS_TOKEN=...
 TICKTICK_REFRESH_TOKEN=...
-MCP_TRANSPORT=sse
+MCP_TRANSPORT=streamable-http
 MCP_HOST=0.0.0.0
 MCP_PORT=8000
+MCP_STREAMABLE_HTTP_PATH=/mcp
 MCP_PUBLIC_URL=https://your-public-domain.example
 ```
 
@@ -151,7 +157,7 @@ Do not deploy this publicly with `MCP_AUTH_MODE=none`. The MCP tools can read an
 After deployment, the remote MCP server URL is:
 
 ```text
-https://your-public-domain.example/sse
+https://your-public-domain.example/mcp
 ```
 
 Use that URL when adding a custom MCP app/server in ChatGPT.
