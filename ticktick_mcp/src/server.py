@@ -3,8 +3,10 @@ import hmac
 import json
 import os
 import logging
-from datetime import datetime, timezone, date, timedelta
+import re
+from datetime import datetime, time, date, timedelta
 from typing import Dict, List, Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.provider import AccessToken
@@ -14,7 +16,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.transport_security import TransportSecuritySettings
 from dotenv import load_dotenv
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from .ticktick_client import TickTickClient
 from .oauth import ALL_SCOPES, READ_SCOPE, WRITE_SCOPE, SingleUserOAuthProvider
@@ -27,6 +29,8 @@ load_dotenv()
 
 SUPPORTED_TRANSPORTS = {"stdio", "sse", "streamable-http"}
 SUPPORTED_AUTH_MODES = {"auto", "none", "bearer", "oauth"}
+DEFAULT_TIMEZONE = os.getenv("MCP_DEFAULT_TIMEZONE", "Europe/Moscow")
+_OFFSET_WITHOUT_COLON_RE = re.compile(r"([+-]\d{2})(\d{2})$")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -50,6 +54,17 @@ def _env_int(name: str, default: int) -> int:
 def _env_list(name: str) -> list[str]:
     value = os.getenv(name, "")
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _local_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(DEFAULT_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        logger.warning("Invalid MCP_DEFAULT_TIMEZONE=%r; using Europe/Moscow", DEFAULT_TIMEZONE)
+        return ZoneInfo("Europe/Moscow")
+
+
+LOCAL_TZ = _local_timezone()
 
 
 class StaticBearerTokenVerifier:
@@ -191,6 +206,65 @@ if _auth_server_provider:
     async def oauth_login(request: Request) -> Response:
         return await _auth_server_provider.handle_login(request)
 
+
+def _tools_count() -> int:
+    return len(mcp._tool_manager.list_tools())
+
+
+def _mcp_auth_health() -> dict[str, Any]:
+    mode = _auth_mode()
+    configured = False
+    if mode == "none":
+        configured = _auth is None and _token_verifier is None and _auth_server_provider is None
+    elif mode == "bearer":
+        configured = bool(os.getenv("MCP_AUTH_TOKEN")) and _auth is not None and _token_verifier is not None
+    elif mode == "oauth":
+        configured = (
+            bool(os.getenv("MCP_OAUTH_PASSWORD"))
+            and bool(os.getenv("MCP_OAUTH_TOKEN_SECRET"))
+            and _auth is not None
+            and _auth_server_provider is not None
+        )
+
+    return {
+        "ok": configured,
+        "mode": mode,
+        "required_scopes": _auth.required_scopes if _auth else [],
+    }
+
+
+def _ticktick_auth_health() -> dict[str, Any]:
+    if not os.getenv("TICKTICK_ACCESS_TOKEN"):
+        return {"ok": False, "configured": False, "error": "missing_access_token"}
+
+    try:
+        client = TickTickClient()
+        projects = client.get_projects()
+        if isinstance(projects, dict) and "error" in projects:
+            return {"ok": False, "configured": True, "error": "api_error"}
+        return {"ok": True, "configured": True}
+    except Exception:
+        logger.exception("TickTick health check failed")
+        return {"ok": False, "configured": True, "error": "client_error"}
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health_check(request: Request) -> Response:
+    mcp_auth = _mcp_auth_health()
+    ticktick_auth = _ticktick_auth_health()
+    ok = mcp_auth["ok"] and ticktick_auth["ok"]
+    payload = {
+        "ok": ok,
+        "service": "ticktick-mcp",
+        "transport": os.getenv("MCP_TRANSPORT", "stdio"),
+        "timezone": str(LOCAL_TZ),
+        "mcp_auth": mcp_auth,
+        "ticktick_auth": ticktick_auth,
+        "tools_count": _tools_count(),
+    }
+    return JSONResponse(payload, status_code=200 if ok else 503)
+
+
 # Create TickTick client
 ticktick = None
 
@@ -222,6 +296,87 @@ def initialize_client():
         logger.error(f"Failed to initialize TickTick client: {e}")
         return False
 
+
+def _parse_task_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip().replace("Z", "+00:00")
+    normalized = _OFFSET_WITHOUT_COLON_RE.sub(r"\1:\2", normalized)
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(LOCAL_TZ)
+
+
+def _format_api_datetime(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    parsed = _parse_task_datetime(value)
+    if not parsed:
+        raise ValueError("Use ISO format: YYYY-MM-DDTHH:mm:ss or with timezone")
+
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _is_midnight(value: datetime) -> bool:
+    return value.timetz().replace(tzinfo=None) == time(0, 0)
+
+
+def _effective_due_datetime(task: Dict[str, Any]) -> datetime | None:
+    due = _parse_task_datetime(task.get("dueDate"))
+    if not due:
+        return None
+
+    start = _parse_task_datetime(task.get("startDate"))
+    if start and _is_midnight(due):
+        return due - timedelta(microseconds=1)
+
+    return due
+
+
+def _effective_due_date(task: Dict[str, Any]) -> date | None:
+    due = _effective_due_datetime(task)
+    return due.date() if due else None
+
+
+def _task_date_matches(task: Dict[str, Any], target_date: date) -> bool:
+    return _effective_due_date(task) == target_date
+
+
+def _now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
+
+def _format_local_datetime(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_task_schedule(task: Dict[str, Any]) -> str | None:
+    start = _parse_task_datetime(task.get("startDate"))
+    due = _parse_task_datetime(task.get("dueDate"))
+    if start and due:
+        if start.date() == due.date() or (due.date() == start.date() + timedelta(days=1) and _is_midnight(due)):
+            return f"{start.strftime('%Y-%m-%d')} {start.strftime('%H:%M')}-{due.strftime('%H:%M')} ({LOCAL_TZ})"
+        return (
+            f"{_format_local_datetime(start)} - {_format_local_datetime(due)} "
+            f"({LOCAL_TZ})"
+        )
+    if start:
+        return f"Start: {_format_local_datetime(start)} ({LOCAL_TZ})"
+    if due:
+        return f"Due: {_format_local_datetime(due)} ({LOCAL_TZ})"
+    return None
+
+
 # Format a task object from TickTick for better display
 def format_task(task: Dict) -> str:
     """Format a task into a human-readable string."""
@@ -231,11 +386,9 @@ def format_task(task: Dict) -> str:
     # Add project ID
     formatted += f"Project ID: {task.get('projectId', 'None')}\n"
     
-    # Add dates if available
-    if task.get('startDate'):
-        formatted += f"Start Date: {task.get('startDate')}\n"
-    if task.get('dueDate'):
-        formatted += f"Due Date: {task.get('dueDate')}\n"
+    schedule = _format_task_schedule(task)
+    if schedule:
+        formatted += f"Schedule: {schedule}\n"
     
     # Add priority if available
     priority_map = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
@@ -433,14 +586,11 @@ async def create_task(
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
     
     try:
-        # Validate dates if provided
-        for date_str, date_name in [(start_date, "start_date"), (due_date, "due_date")]:
-            if date_str:
-                try:
-                    # Try to parse the date to validate it
-                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                except ValueError:
-                    return f"Invalid {date_name} format. Use ISO format: YYYY-MM-DDThh:mm:ss+0000"
+        try:
+            start_date = _format_api_datetime(start_date)
+            due_date = _format_api_datetime(due_date)
+        except ValueError as e:
+            return f"Invalid date format. {str(e)}"
         
         task = ticktick.create_task(
             title=title,
@@ -494,14 +644,11 @@ async def update_task(
         return "Invalid priority. Must be 0 (None), 1 (Low), 3 (Medium), or 5 (High)."
     
     try:
-        # Validate dates if provided
-        for date_str, date_name in [(start_date, "start_date"), (due_date, "due_date")]:
-            if date_str:
-                try:
-                    # Try to parse the date to validate it
-                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                except ValueError:
-                    return f"Invalid {date_name} format. Use ISO format: YYYY-MM-DDThh:mm:ss+0000"
+        try:
+            start_date = _format_api_datetime(start_date)
+            due_date = _format_api_datetime(due_date)
+        except ValueError as e:
+            return f"Invalid date format. {str(e)}"
         
         task = ticktick.update_task(
             task_id=task_id,
@@ -651,41 +798,17 @@ PRIORITY_MAP = {0: "None", 1: "Low", 3: "Medium", 5: "High"}
 
 def _is_task_due_today(task: Dict[str, Any]) -> bool:
     """Check if a task is due today."""
-    due_date = task.get('dueDate')
-    if not due_date:
-        return False
-    
-    try:
-        task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-        today_date = datetime.now(timezone.utc).date()
-        return task_due_date == today_date
-    except (ValueError, TypeError):
-        return False
+    return _task_date_matches(task, _now_local().date())
 
 def _is_task_overdue(task: Dict[str, Any]) -> bool:
     """Check if a task is overdue."""
-    due_date = task.get('dueDate')
-    if not due_date:
-        return False
-    
-    try:
-        task_due = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z")
-        return task_due < datetime.now(timezone.utc)
-    except (ValueError, TypeError):
-        return False
+    due = _effective_due_datetime(task)
+    return bool(due and due < _now_local())
 
 def _is_task_due_in_days(task: Dict[str, Any], days: int) -> bool:
     """Check if a task is due in exactly X days."""
-    due_date = task.get('dueDate')
-    if not due_date:
-        return False
-    
-    try:
-        task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-        target_date = (datetime.now(timezone.utc) + timedelta(days=days)).date()
-        return task_due_date == target_date
-    except (ValueError, TypeError):
-        return False
+    target_date = (_now_local() + timedelta(days=days)).date()
+    return _task_date_matches(task, target_date)
 
 def _task_matches_search(task: Dict[str, Any], search_term: str) -> bool:
     """Check if a task matches the search term (case-insensitive)."""
@@ -734,15 +857,7 @@ def _validate_task_data(task_data: Dict[str, Any], task_index: int) -> Optional[
         date_str = task_data.get(date_field)
         if date_str:
             try:
-                # Try to parse the date to validate it
-                # Handle both with and without timezone info
-                if date_str.endswith('Z'):
-                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                elif '+' in date_str or date_str.endswith(('00', '30')):
-                    datetime.fromisoformat(date_str)
-                else:
-                    # Assume local timezone if no timezone specified
-                    datetime.fromisoformat(date_str)
+                _format_api_datetime(date_str)
             except ValueError:
                 return f"Task {task_index + 1}: Invalid {date_field} format '{date_str}'. Use ISO format: YYYY-MM-DDTHH:mm:ss or with timezone"
     
@@ -888,7 +1003,7 @@ async def get_overdue_tasks() -> str:
 
 @mcp.tool()
 async def get_tasks_due_tomorrow() -> str:
-    """Get all tasks from TickTick that are due today. Ignores closed projects."""
+    """Get all tasks from TickTick that are due tomorrow. Ignores closed projects."""
     if not ticktick:
         if not initialize_client():
             return "Failed to initialize TickTick client. Please check your API credentials."
@@ -898,13 +1013,13 @@ async def get_tasks_due_tomorrow() -> str:
         if 'error' in projects:
             return f"Error fetching projects: {projects['error']}"
         
-        def today_filter(task: Dict[str, Any]) -> bool:
+        def tomorrow_filter(task: Dict[str, Any]) -> bool:
             return _is_task_due_in_days(task, 1)
         
-        return _get_project_tasks_by_filter(projects, today_filter, "due today")
+        return _get_project_tasks_by_filter(projects, tomorrow_filter, "due tomorrow")
         
     except Exception as e:
-        logger.error(f"Error in get_tasks_due_today: {e}")
+        logger.error(f"Error in get_tasks_due_tomorrow: {e}")
         return f"Error retrieving projects: {str(e)}"
     
 @mcp.tool()
@@ -950,17 +1065,12 @@ async def get_tasks_due_this_week() -> str:
             return f"Error fetching projects: {projects['error']}"
         
         def week_filter(task: Dict[str, Any]) -> bool:
-            due_date = task.get('dueDate')
-            if not due_date:
+            task_due_date = _effective_due_date(task)
+            if not task_due_date:
                 return False
-            
-            try:
-                task_due_date = datetime.strptime(due_date, "%Y-%m-%dT%H:%M:%S.%f%z").date()
-                today = datetime.now(timezone.utc).date()
-                week_from_today = today + timedelta(days=7)
-                return today <= task_due_date <= week_from_today
-            except (ValueError, TypeError):
-                return False
+            today = _now_local().date()
+            week_from_today = today + timedelta(days=7)
+            return today <= task_due_date <= week_from_today
         
         return _get_project_tasks_by_filter(projects, week_filter, "due this week")
         
@@ -1056,8 +1166,8 @@ async def batch_create_tasks(tasks: List[Dict[str, Any]]) -> str:
                 title = task_data['title']
                 project_id = task_data['project_id']
                 content = task_data.get('content')
-                start_date = task_data.get('start_date')
-                due_date = task_data.get('due_date')
+                start_date = _format_api_datetime(task_data.get('start_date'))
+                due_date = _format_api_datetime(task_data.get('due_date'))
                 priority = task_data.get('priority', 0)
                 
                 # Create the task

@@ -126,6 +126,7 @@ MCP_TRANSPORT=streamable-http
 MCP_HOST=0.0.0.0
 MCP_PORT=8000
 MCP_STREAMABLE_HTTP_PATH=/mcp
+MCP_DEFAULT_TIMEZONE=Europe/Moscow
 MCP_PUBLIC_URL=https://your-public-domain.example
 ```
 
@@ -170,6 +171,18 @@ For ChatGPT, choose OAuth authentication. Dynamic Client Registration should dis
 - Scopes: `ticktick:read ticktick:write`
 
 Write tools require the `ticktick:write` scope. Read access to the MCP transport requires `ticktick:read`.
+
+### Health and local time handling
+
+The service exposes a public health endpoint:
+
+```text
+https://your-public-domain.example/health
+```
+
+It reports TickTick auth status, MCP auth status, configured transport, timezone, and MCP tools count without returning secrets.
+
+Task dates are parsed and displayed in `MCP_DEFAULT_TIMEZONE`, which defaults to `Europe/Moscow`. When a task has both `startDate` and `dueDate`, the formatted task output shows a compact interval such as `2026-04-22 10:30-11:00 (Europe/Moscow)`. Intervals ending exactly at `00:00` are grouped under the previous local day.
 
 ## Authentication with Dida365
 

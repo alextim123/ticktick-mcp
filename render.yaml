@@ -15,6 +15,8 @@ services:
         value: /messages/
       - key: MCP_STREAMABLE_HTTP_PATH
         value: /mcp
+      - key: MCP_DEFAULT_TIMEZONE
+        value: Europe/Moscow
       - key: MCP_AUTH_MODE
         value: oauth
       - key: TICKTICK_CLIENT_ID
